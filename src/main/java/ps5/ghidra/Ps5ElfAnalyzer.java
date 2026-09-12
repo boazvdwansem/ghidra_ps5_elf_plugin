@@ -138,6 +138,7 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
         private long jmprel;
         private long jmprelSize;
         private long sonameOffset = -1;
+        private long originalFilenameOffset = -1;
         private final List<Long> neededOffsets = new ArrayList<>();
         private long strtab;
         private long symtab;
@@ -169,10 +170,11 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
                 if (type == PT_SCE_PROCPARAM || type == PT_SCE_MODULE_PARAM || type == PT_GNU_EH_FRAME ||
                         type == PT_SCE_COMMENT || type == PT_SCE_VERSION) {
                     addComment(vaddr, "PS5 program header type 0x" + Long.toHexString(type));
-                    if (type == PT_SCE_PROCPARAM) parseProcessParam(vaddr, filesz);
-                    if (type == PT_SCE_MODULE_PARAM) parseModuleParam(vaddr, filesz);
-                    if (type == PT_SCE_COMMENT) parseCommentSegment(vaddr, filesz);
-                    if (type == PT_SCE_VERSION) parseVersionSegment(vaddr, filesz);
+                    if (type == PT_SCE_PROCPARAM) tryParseProcessParam(vaddr, filesz);
+                    if (type == PT_SCE_MODULE_PARAM) tryParseModuleParam(vaddr, filesz);
+                    if (type == PT_SCE_COMMENT) tryParseCommentSegment(vaddr, filesz);
+                    if (type == PT_SCE_VERSION) tryParseVersionSegment(vaddr, filesz);
+                    if (type == PT_GNU_EH_FRAME) tryParseEhFrameHeader(vaddr, filesz);
                 }
             }
             if (dynamic == 0) return;
@@ -218,7 +220,7 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
                     case (int) DT_NEEDED: neededOffsets.add(value); break;
                     case (int) DT_SCE_ORIGINAL_FILENAME:
                     case (int) DT_SCE_ORIGINAL_FILENAME_PPR:
-                        originalFilename = stringAt(strtab + value); break;
+                        originalFilenameOffset = value; break;
                     case (int) DT_INIT: addComment(value, "PS5 init procedure"); break;
                     case (int) DT_FINI: addComment(value, "PS5 fini procedure"); break;
                     default: parseObjectTag(tag, value); break;
@@ -249,6 +251,7 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
         private void resolveMetadata() throws Exception {
             if (strtab == 0) return;
             if (sonameOffset >= 0) soname = stringAt(strtab + sonameOffset);
+            if (originalFilenameOffset >= 0) originalFilename = stringAt(strtab + originalFilenameOffset);
             for (long offset : neededOffsets) {
                 addComment(program.getImageBase(), "PS5 needed module: " + stringAt(strtab + offset));
             }
@@ -339,6 +342,11 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
                     ", SDK=0x" + Long.toHexString(u32(address(start + 16))));
         }
 
+        private void tryParseProcessParam(long start, long size) {
+            try { parseProcessParam(start, size); }
+            catch (Exception e) { log.appendMsg("PS5 ELF analyzer: unable to read process parameters: " + e.getMessage()); }
+        }
+
         private void parseModuleParam(long start, long size) throws Exception {
             if (size < 8) return;
             String magic = ascii(start + 8, 4);
@@ -348,6 +356,11 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
             }
             addComment(start, "PS5 sceModuleParam: entries=" + u32(address(start + 12)) +
                     ", SDK=0x" + Long.toHexString(q64(address(start + 16))));
+        }
+
+        private void tryParseModuleParam(long start, long size) {
+            try { parseModuleParam(start, size); }
+            catch (Exception e) { log.appendMsg("PS5 ELF analyzer: unable to read module parameters: " + e.getMessage()); }
         }
 
         private void parseCommentSegment(long start, long size) throws Exception {
@@ -367,6 +380,11 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
             }
         }
 
+        private void tryParseCommentSegment(long start, long size) {
+            try { parseCommentSegment(start, size); }
+            catch (Exception e) { log.appendMsg("PS5 ELF analyzer: unable to read comment segment: " + e.getMessage()); }
+        }
+
         private void parseVersionSegment(long start, long size) throws Exception {
             long cursor = start;
             long end = start + size;
@@ -384,6 +402,68 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
             }
         }
 
+        private void tryParseVersionSegment(long start, long size) {
+            try { parseVersionSegment(start, size); }
+            catch (Exception e) { log.appendMsg("PS5 ELF analyzer: unable to read version segment: " + e.getMessage()); }
+        }
+
+        private void tryParseEhFrameHeader(long start, long size) {
+            try {
+                if (size < 4) return;
+                Address cursor = address(start);
+                int version = program.getMemory().getByte(cursor) & 0xff;
+                int frameEncoding = program.getMemory().getByte(cursor.add(1)) & 0xff;
+                int countEncoding = program.getMemory().getByte(cursor.add(2)) & 0xff;
+                int tableEncoding = program.getMemory().getByte(cursor.add(3)) & 0xff;
+                addComment(start, "PS5 EH frame header: version=" + version + ", frame=0x" +
+                        Integer.toHexString(frameEncoding) + ", count=0x" + Integer.toHexString(countEncoding) +
+                        ", table=0x" + Integer.toHexString(tableEncoding));
+                EncodedValue frame = readEncoded(cursor.add(4), frameEncoding, start);
+                EncodedValue count = readEncoded(frame.next, countEncoding, start);
+                long entries = Math.min(count.value, (size - (count.next.getOffset() - start)) / 8);
+                Address entry = count.next;
+                for (long i = 0; i < entries; i++) {
+                    EncodedValue location = readEncoded(entry, tableEncoding, start);
+                    EncodedValue fde = readEncoded(location.next, tableEncoding, start);
+                    if (location.value != 0) addComment(location.value, "PS5 EH function table entry");
+                    entry = fde.next;
+                }
+            }
+            catch (Exception e) {
+                log.appendMsg("PS5 ELF analyzer: unable to parse EH frame header: " + e.getMessage());
+            }
+        }
+
+        private EncodedValue readEncoded(Address start, int encoding, long dataBase) throws Exception {
+            int format = encoding & 0x0f;
+            long value;
+            Address next = start;
+            if (format == 0x00) { value = q64(next); next = next.add(8); }
+            else if (format == 0x03) { value = u32(next); next = next.add(4); }
+            else if (format == 0x04) { value = q64(next); next = next.add(8); }
+            else if (format == 0x0b) { value = program.getMemory().getInt(next); next = next.add(4); }
+            else if (format == 0x0c) { value = q64(next); next = next.add(8); }
+            else if (format == 0x01 || format == 0x09) {
+                long result = 0;
+                int shift = 0;
+                int byteValue;
+                do {
+                    byteValue = program.getMemory().getByte(next) & 0xff;
+                    result |= (long) (byteValue & 0x7f) << shift;
+                    shift += 7;
+                    next = next.add(1);
+                } while ((byteValue & 0x80) != 0 && shift < 64);
+                value = format == 0x09 && shift < 64 && (byteValue & 0x40) != 0 ? result - (1L << shift) : result;
+            }
+            else throw new IOException("unsupported EH encoding 0x" + Integer.toHexString(encoding));
+            int application = encoding & 0x70;
+            if (application == 0x10) value += start.getOffset();
+            else if (application == 0x30) value += dataBase;
+            else if (application != 0) throw new IOException("unsupported EH application 0x" + Integer.toHexString(application));
+            if ((encoding & 0x80) != 0 && value != 0) value = q64(address(value));
+            return new EncodedValue(value, next);
+        }
+
         private String ascii(long start, long length) throws Exception {
             StringBuilder result = new StringBuilder();
             for (long i = 0; i < length && i < 0x10000; i++) {
@@ -398,7 +478,14 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
 
         private void label(long value, String name, String comment) throws Exception {
             Address target = address(value);
-            program.getSymbolTable().createLabel(target, name, SourceType.IMPORTED);
+            if (program.getMemory().contains(target)) {
+                try {
+                    program.getSymbolTable().createLabel(target, name, SourceType.IMPORTED);
+                }
+                catch (Exception e) {
+                    log.appendMsg("PS5 ELF analyzer: unable to create label " + name + ": " + e.getMessage());
+                }
+            }
             addComment(value, comment);
         }
 
@@ -407,13 +494,18 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
         }
 
         private void addComment(Address target, String comment) throws Exception {
-            if (program.getMemory().contains(target)) program.getListing().setComment(target, CodeUnit.PRE_COMMENT, comment);
+            if (!program.getMemory().contains(target)) return;
+            CodeUnit codeUnit = program.getListing().getCodeUnitAt(target);
+            String existing = codeUnit == null ? null : codeUnit.getComment(CodeUnit.PRE_COMMENT);
+            if (existing != null && !existing.contains(comment)) comment = existing + "\n" + comment;
+            program.getListing().setComment(target, CodeUnit.PRE_COMMENT, comment);
         }
 
         private String stringAt(long value) throws Exception {
             Address target = address(value);
             StringBuilder result = new StringBuilder();
-            for (int i = 0; i < 0x10000 && program.getMemory().contains(target.add(i)); i++) {
+            long limit = strtabSize > 0 && value >= strtab ? strtabSize - (value - strtab) : 0x10000;
+            for (long i = 0; i < limit && i < 0x10000 && program.getMemory().contains(target.add(i)); i++) {
                 int b = program.getMemory().getByte(target.add(i)) & 0xff;
                 if (b == 0) break;
                 result.append((char) b);
@@ -425,6 +517,16 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
         private long u32(Address address) throws Exception { return program.getMemory().getInt(address) & 0xffffffffL; }
         private int u16(Address address) throws Exception { return program.getMemory().getShort(address) & 0xffff; }
         private Address address(long value) { return program.getAddressFactory().getDefaultAddressSpace().getAddress(value); }
+    }
+
+    private static final class EncodedValue {
+        final long value;
+        final Address next;
+
+        EncodedValue(long value, Address next) {
+            this.value = value;
+            this.next = next;
+        }
     }
 
     private static final class ObjectInfo {
