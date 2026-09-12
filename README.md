@@ -20,8 +20,8 @@ metadata, module and library descriptors, SCE comment/version and parameter
 segments, NID-encoded symbols, and RELA/JMPREL imports. Decoded exports and
 defined symbols are applied as labels and functions.
 
-## Known bugs
-- Exception-handler metadata is currently reported but not used to refine function boundaries.
+## Notes
+- The analyzer creates missing PS5 program-header blocks and uses GNU EH-frame FDE ranges to refine function boundaries when the required records and encodings are present.
 
 P.S. PRs with bug fixes and improvements are welcome here: [Flatz repository](https://github.com/flatz/ida_ps5_elf_plugin)
 

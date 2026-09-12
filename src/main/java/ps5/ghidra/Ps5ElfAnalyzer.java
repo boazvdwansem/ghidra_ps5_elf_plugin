@@ -13,8 +13,12 @@ import ghidra.program.model.symbol.SourceType;
 import ghidra.util.exception.CancelledException;
 import ghidra.util.task.TaskMonitor;
 import ghidra.app.services.AbstractAnalyzer;
+import ghidra.app.util.MemoryBlockUtils;
+import ghidra.program.model.mem.MemoryBlock;
 
 import java.io.BufferedReader;
+import java.io.FileInputStream;
+import java.io.InputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -162,6 +166,7 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
             for (int i = 0; i < phnum; i++) {
                 Address ph = base.add(phoff + (long) i * phentsize);
                 long type = u32(ph);
+                long fileOffset = q64(ph.add(8));
                 long vaddr = q64(ph.add(16));
                 long filesz = q64(ph.add(32));
                 long memsz = q64(ph.add(40));
@@ -169,6 +174,7 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
                 if (type == PT_DYNAMIC) dynamicSize = memsz;
                 if (type == PT_SCE_PROCPARAM || type == PT_SCE_MODULE_PARAM || type == PT_GNU_EH_FRAME ||
                         type == PT_SCE_COMMENT || type == PT_SCE_VERSION) {
+                    ensureSpecialSegment(type, fileOffset, vaddr, filesz, memsz);
                     addComment(vaddr, "PS5 program header type 0x" + Long.toHexString(type));
                     if (type == PT_SCE_PROCPARAM) tryParseProcessParam(vaddr, filesz);
                     if (type == PT_SCE_MODULE_PARAM) tryParseModuleParam(vaddr, filesz);
@@ -190,6 +196,40 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
             applyRelocations(jmprel, jmprelSize, "JMPREL");
             if (soname != null) addComment(program.getImageBase(), "PS5 SONAME: " + soname);
             if (originalFilename != null) addComment(program.getImageBase(), "PS5 original filename: " + originalFilename);
+        }
+
+        private void ensureSpecialSegment(long type, long fileOffset, long vaddr, long filesz, long memsz) {
+            if (filesz == 0 || program.getMemory().getBlock(address(vaddr)) != null) return;
+            String name;
+            if (type == PT_SCE_PROCPARAM) name = ".sce_process_param";
+            else if (type == PT_SCE_MODULE_PARAM) name = ".sce_module_param";
+            else if (type == PT_SCE_COMMENT) name = ".sce_comment";
+            else if (type == PT_SCE_VERSION) name = ".sce_version";
+            else name = ".eh_frame_hdr";
+            String executablePath = program.getExecutablePath();
+            if (executablePath == null || executablePath.isEmpty()) {
+                log.appendMsg("PS5 ELF analyzer: no executable path for " + name);
+                return;
+            }
+            try (InputStream stream = new FileInputStream(executablePath)) {
+                long skipped = 0;
+                while (skipped < fileOffset) {
+                    long amount = stream.skip(fileOffset - skipped);
+                    if (amount <= 0) throw new IOException("unable to seek to program-header data");
+                    skipped += amount;
+                }
+                long length = Math.min(filesz, memsz == 0 ? filesz : memsz);
+                MemoryBlock block = MemoryBlockUtils.createInitializedBlock(program, false, name,
+                        address(vaddr), stream, length, "PS5 program header 0x" + Long.toHexString(type),
+                        executablePath, false, false, type == PT_GNU_EH_FRAME, log, monitor);
+                if (block != null && memsz > length) {
+                    long bssSize = memsz - length;
+                    program.getMemory().createUninitializedBlock(name + ".bss", address(vaddr + length), bssSize, false);
+                }
+            }
+            catch (Exception e) {
+                log.appendMsg("PS5 ELF analyzer: unable to create " + name + ": " + e.getMessage());
+            }
         }
 
         private void parseDynamic(long address) throws Exception {
@@ -425,13 +465,79 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
                 for (long i = 0; i < entries; i++) {
                     EncodedValue location = readEncoded(entry, tableEncoding, start);
                     EncodedValue fde = readEncoded(location.next, tableEncoding, start);
-                    if (location.value != 0) addComment(location.value, "PS5 EH function table entry");
+                    if (location.value != 0) {
+                        addComment(location.value, "PS5 EH function table entry");
+                        parseFdeFunction(fde.value);
+                    }
                     entry = fde.next;
                 }
             }
             catch (Exception e) {
                 log.appendMsg("PS5 ELF analyzer: unable to parse EH frame header: " + e.getMessage());
             }
+        }
+
+        private void parseFdeFunction(long fdeAddress) throws Exception {
+            Address fde = address(fdeAddress);
+            long length = u32(fde);
+            if (length < 8 || length > 0x100000 || !program.getMemory().contains(fde.add(length + 4))) return;
+            long cieOffset = u32(fde.add(4));
+            long cieAddress = fdeAddress + 4 - cieOffset;
+            int encoding = findFdeEncoding(cieAddress);
+            if (encoding < 0) return;
+            EncodedValue initial = readEncoded(fde.add(8), encoding, fdeAddress + 8);
+            EncodedValue range = readEncoded(initial.next, encoding & 0x0f, fdeAddress + 8);
+            if (initial.value == 0 || range.value <= 0 || initial.value > Long.MAX_VALUE - range.value) return;
+            Address functionStart = address(initial.value);
+            Address functionEnd = address(initial.value + range.value - 1);
+            if (!program.getMemory().contains(functionStart) || !program.getMemory().contains(functionEnd)) return;
+            FunctionManager manager = program.getFunctionManager();
+            if (manager.getFunctionAt(functionStart) == null) {
+                try {
+                    manager.createFunction("eh_" + Long.toHexString(initial.value), functionStart,
+                            new AddressSet(functionStart, functionEnd), SourceType.ANALYSIS);
+                }
+                catch (Exception e) {
+                    log.appendMsg("PS5 ELF analyzer: unable to create EH function at 0x" +
+                            Long.toHexString(initial.value) + ": " + e.getMessage());
+                }
+            }
+        }
+
+        private int findFdeEncoding(long cieAddress) throws Exception {
+            Address cie = address(cieAddress);
+            long length = u32(cie);
+            if (length < 8 || length > 0x100000) return -1;
+            Address cursor = cie.add(8);
+            int version = program.getMemory().getByte(cursor) & 0xff;
+            cursor = cursor.add(1);
+            StringBuilder augmentation = new StringBuilder();
+            int byteValue;
+            do {
+                byteValue = program.getMemory().getByte(cursor) & 0xff;
+                cursor = cursor.add(1);
+                if (byteValue != 0) augmentation.append((char) byteValue);
+            } while (byteValue != 0 && augmentation.length() < 32);
+            LebValue codeAlignment = readLeb(cursor, false);
+            cursor = codeAlignment.next;
+            LebValue dataAlignment = readLeb(cursor, true);
+            cursor = dataAlignment.next;
+            cursor = cursor.add(version == 1 ? 1 : readLeb(cursor, false).next.getOffset() - cursor.getOffset());
+            if (!augmentation.toString().startsWith("z")) return 0;
+            LebValue augmentationLength = readLeb(cursor, false);
+            cursor = augmentationLength.next;
+            Address augmentationEnd = cursor.add(augmentationLength.value);
+            for (int i = 1; i < augmentation.length() && cursor.getOffset() < augmentationEnd.getOffset(); i++) {
+                char item = augmentation.charAt(i);
+                if (item == 'R') return program.getMemory().getByte(cursor) & 0xff;
+                if (item == 'L') cursor = cursor.add(1);
+                else if (item == 'P') {
+                    int personalityEncoding = program.getMemory().getByte(cursor) & 0xff;
+                    cursor = cursor.add(1);
+                    cursor = readEncoded(cursor, personalityEncoding, cursor.getOffset()).next;
+                }
+            }
+            return 0;
         }
 
         private EncodedValue readEncoded(Address start, int encoding, long dataBase) throws Exception {
@@ -462,6 +568,19 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
             else if (application != 0) throw new IOException("unsupported EH application 0x" + Integer.toHexString(application));
             if ((encoding & 0x80) != 0 && value != 0) value = q64(address(value));
             return new EncodedValue(value, next);
+        }
+
+        private LebValue readLeb(Address start, boolean signed) throws Exception {
+            long result = 0;
+            int shift = 0;
+            int byteValue;
+            do {
+                byteValue = program.getMemory().getByte(start.add(shift / 7)) & 0xff;
+                result |= (long) (byteValue & 0x7f) << shift;
+                shift += 7;
+            } while ((byteValue & 0x80) != 0 && shift < 64);
+            if (signed && shift < 64 && (byteValue & 0x40) != 0) result -= 1L << shift;
+            return new LebValue(result, start.add((shift + 6) / 7));
         }
 
         private String ascii(long start, long length) throws Exception {
@@ -524,6 +643,16 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
         final Address next;
 
         EncodedValue(long value, Address next) {
+            this.value = value;
+            this.next = next;
+        }
+    }
+
+    private static final class LebValue {
+        final long value;
+        final Address next;
+
+        LebValue(long value, Address next) {
             this.value = value;
             this.next = next;
         }
