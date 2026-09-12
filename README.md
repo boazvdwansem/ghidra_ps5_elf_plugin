@@ -19,6 +19,16 @@ The extension is installed as `ps5-elf-analyzer`. The analyzer is enabled by def
 library information as program metadata and applies decoded exports and defined
 symbols as labels and functions.
 
+## Instructions
+
+TBA
+
+## Known bugs
+- Need to update some structures, e.g. sceProcessParam, to reflect more fields that it may take.
+- Need to parse exception handler sections properly because their format was changed since PS4. Could be useful to tweak function boundaries even more.
+
+P.S. PRs with bug fixes and improvements are welcome here: [Flatz repository](https://github.com/flatz/ida_ps5_elf_plugin)
+
 ## Credits
 
 Flatz - https://github.com/flatz/ida_ps5_elf_plugin
