@@ -19,8 +19,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -33,11 +35,21 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
     private static final long PT_SCE_PROCPARAM = 0x61000001L;
     private static final long PT_SCE_MODULE_PARAM = 0x61000002L;
     private static final long PT_GNU_EH_FRAME = 0x6474e550L;
+    private static final long PT_SCE_COMMENT = 0x6fffff00L;
+    private static final long PT_SCE_VERSION = 0x6fffff01L;
     private static final long DT_NULL = 0;
     private static final long DT_NEEDED = 1;
+    private static final long DT_PLTGOT = 3;
+    private static final long DT_HASH = 4;
+    private static final long DT_RELA = 7;
+    private static final long DT_RELASZ = 8;
+    private static final long DT_RELAENT = 9;
     private static final long DT_SONAME = 14;
     private static final long DT_INIT = 12;
     private static final long DT_FINI = 13;
+    private static final long DT_PLTREL = 20;
+    private static final long DT_JMPREL = 23;
+    private static final long DT_PLTRELSZ = 2;
     private static final long DT_STRTAB = 5;
     private static final long DT_SYMTAB = 6;
     private static final long DT_STRSZ = 10;
@@ -51,6 +63,8 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
     private static final long DT_SCE_EXPORT_LIB_ATTR = 0x61000017L;
     private static final long DT_SCE_IMPORT_LIB_ATTR = 0x61000019L;
     private static final long DT_SCE_SYMTABSZ = 0x6100003fL;
+    private static final long DT_SCE_ORIGINAL_FILENAME = 0x61000009L;
+    private static final long DT_SCE_ORIGINAL_FILENAME_PPR = 0x61000041L;
     private static final long DT_SCE_MODULE_INFO_PPR = 0x61000043L;
     private static final long DT_SCE_NEEDED_MODULE_PPR = 0x61000045L;
     private static final long DT_SCE_IMPORT_LIB_PPR = 0x61000047L;
@@ -115,11 +129,22 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
         private final Map<Long, ObjectInfo> libraries = new HashMap<>();
         private final Map<Long, String> knownNids = loadKnownNids();
         private final Set<Long> functions = new HashSet<>();
+        private final List<SymbolInfo> symbols = new ArrayList<>();
+        private long dynamicSize;
+        private long strtabSize;
+        private long rela;
+        private long relaSize;
+        private long relaEnt = 24;
+        private long jmprel;
+        private long jmprelSize;
+        private long sonameOffset = -1;
+        private final List<Long> neededOffsets = new ArrayList<>();
         private long strtab;
         private long symtab;
         private long symtabSize;
         private long syment = 24;
         private String soname;
+        private String originalFilename;
 
         Context(Program program, TaskMonitor monitor, MessageLog log) {
             this.program = program;
@@ -137,24 +162,37 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
                 Address ph = base.add(phoff + (long) i * phentsize);
                 long type = u32(ph);
                 long vaddr = q64(ph.add(16));
+                long filesz = q64(ph.add(32));
+                long memsz = q64(ph.add(40));
                 if (type == PT_DYNAMIC) dynamic = vaddr;
-                if (type == PT_SCE_PROCPARAM || type == PT_SCE_MODULE_PARAM || type == PT_GNU_EH_FRAME) {
+                if (type == PT_DYNAMIC) dynamicSize = memsz;
+                if (type == PT_SCE_PROCPARAM || type == PT_SCE_MODULE_PARAM || type == PT_GNU_EH_FRAME ||
+                        type == PT_SCE_COMMENT || type == PT_SCE_VERSION) {
                     addComment(vaddr, "PS5 program header type 0x" + Long.toHexString(type));
+                    if (type == PT_SCE_PROCPARAM) parseProcessParam(vaddr, filesz);
+                    if (type == PT_SCE_MODULE_PARAM) parseModuleParam(vaddr, filesz);
+                    if (type == PT_SCE_COMMENT) parseCommentSegment(vaddr, filesz);
+                    if (type == PT_SCE_VERSION) parseVersionSegment(vaddr, filesz);
                 }
             }
             if (dynamic == 0) return;
             parseDynamic(dynamic);
+            resolveMetadata();
             if (strtab == 0 || symtab == 0 || syment < 24) return;
             int count = (int) (symtabSize / syment);
             for (int i = 0; i < count; i++) {
                 monitor.checkCanceled();
                 parseSymbol(symtab + i * syment);
             }
+            applyRelocations(rela, relaSize, "RELA");
+            applyRelocations(jmprel, jmprelSize, "JMPREL");
             if (soname != null) addComment(program.getImageBase(), "PS5 SONAME: " + soname);
+            if (originalFilename != null) addComment(program.getImageBase(), "PS5 original filename: " + originalFilename);
         }
 
         private void parseDynamic(long address) throws Exception {
-            for (int i = 0; i < 0x10000; i++) {
+            long limit = dynamicSize > 0 ? dynamicSize / 16 : 0x10000;
+            for (long i = 0; i < limit; i++) {
                 Address entry = address(address + i * 16L);
                 long tag = q64(entry);
                 long value = q64(entry.add(8));
@@ -162,11 +200,25 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
                 switch ((int) tag) {
                     case (int) DT_STRTAB: strtab = value; break;
                     case (int) DT_SYMTAB: symtab = value; break;
-                    case (int) DT_STRSZ: break;
+                    case (int) DT_STRSZ: strtabSize = value; break;
                     case (int) DT_SYMENT: syment = value; break;
                     case (int) DT_SCE_SYMTABSZ: symtabSize = value; break;
-                    case (int) DT_SONAME: soname = stringAt(strtab + value); break;
-                    case (int) DT_NEEDED: addComment(address, "PS5 needed module: " + stringAt(strtab + value)); break;
+                    case (int) DT_RELA: rela = value; break;
+                    case (int) DT_RELASZ: relaSize = value; break;
+                    case (int) DT_RELAENT: relaEnt = value; break;
+                    case (int) DT_JMPREL: jmprel = value; break;
+                    case (int) DT_PLTRELSZ: jmprelSize = value; break;
+                    case (int) DT_PLTREL:
+                        if (value != DT_RELA) log.appendMsg("PS5 ELF analyzer: unsupported PLT relocation format 0x" + Long.toHexString(value));
+                        break;
+                    case (int) DT_SCE_IDTABENTSZ:
+                        if (value != 8) log.appendMsg("PS5 ELF analyzer: unsupported ID table entry size 0x" + Long.toHexString(value));
+                        break;
+                    case (int) DT_SONAME: sonameOffset = value; break;
+                    case (int) DT_NEEDED: neededOffsets.add(value); break;
+                    case (int) DT_SCE_ORIGINAL_FILENAME:
+                    case (int) DT_SCE_ORIGINAL_FILENAME_PPR:
+                        originalFilename = stringAt(strtab + value); break;
                     case (int) DT_INIT: addComment(value, "PS5 init procedure"); break;
                     case (int) DT_FINI: addComment(value, "PS5 fini procedure"); break;
                     default: parseObjectTag(tag, value); break;
@@ -184,14 +236,31 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
                 Map<Long, ObjectInfo> target = module ? modules : libraries;
                 ObjectInfo object = target.computeIfAbsent(id, ignored -> new ObjectInfo());
                 object.export = export;
-                object.name = stringAt(strtab + (value & 0xffffffffL));
+                object.nameOffset = value & 0xffffffffL;
                 object.version = ((value >>> 32) & 0xff) + "." + ((value >>> 40) & 0xff);
-                addComment(program.getImageBase(), (module ? "PS5 module " : "PS5 library ") + id + ": " + object.name);
             }
             if (tag == DT_SCE_MODULE_ATTR || tag == DT_SCE_EXPORT_LIB_ATTR || tag == DT_SCE_IMPORT_LIB_ATTR) {
                 long id = (value >>> 48) & 0xffff;
                 Map<Long, ObjectInfo> target = tag == DT_SCE_MODULE_ATTR ? modules : libraries;
                 target.computeIfAbsent(id, ignored -> new ObjectInfo()).attributes = value & 0xffffffffffffL;
+            }
+        }
+
+        private void resolveMetadata() throws Exception {
+            if (strtab == 0) return;
+            if (sonameOffset >= 0) soname = stringAt(strtab + sonameOffset);
+            for (long offset : neededOffsets) {
+                addComment(program.getImageBase(), "PS5 needed module: " + stringAt(strtab + offset));
+            }
+            for (Map.Entry<Long, ObjectInfo> entry : modules.entrySet()) {
+                ObjectInfo object = entry.getValue();
+                if (object.nameOffset >= 0) object.name = stringAt(strtab + object.nameOffset);
+                addComment(program.getImageBase(), "PS5 module " + entry.getKey() + ": " + object.describe());
+            }
+            for (Map.Entry<Long, ObjectInfo> entry : libraries.entrySet()) {
+                ObjectInfo object = entry.getValue();
+                if (object.nameOffset >= 0) object.name = stringAt(strtab + object.nameOffset);
+                addComment(program.getImageBase(), "PS5 library " + entry.getKey() + ": " + object.describe());
             }
         }
 
@@ -202,15 +271,18 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
             int shndx = u16(symbol.add(6));
             long value = q64(symbol.add(8));
             long size = q64(symbol.add(16));
-            if (shndx == 0 || (info & 0xf) != 2 && (info & 0xf) != 1 || nameOffset == 0) return;
+            int type = info & 0xf;
+            if ((type != 2 && type != 1) || nameOffset == 0) return;
             String encoded = stringAt(strtab + nameOffset);
-            String name = decodeSymbolName(encoded, info & 0xf);
-            if (name == null || value == 0) return;
+            String name = decodeSymbolName(encoded, type);
+            symbols.add(new SymbolInfo(name, encoded, value, size, shndx, type == 2));
+            if (name == null || value == 0 || shndx == 0) return;
             label(value, name, "PS5 symbol: " + encoded);
-            if ((info & 0xf) == 2 && size > 0 && functions.add(value)) {
+            if (type == 2 && size > 0 && functions.add(value)) {
                 FunctionManager manager = program.getFunctionManager();
                 if (manager.getFunctionAt(address(value)) == null) {
-                    manager.createFunction(name, address(value), new AddressSet(address(value), address(value + size - 1)), SourceType.IMPORTED);
+                    manager.createFunction(name, address(value),
+                            new AddressSet(address(value), address(value + size - 1)), SourceType.IMPORTED);
                 }
             }
         }
@@ -219,14 +291,109 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
             String[] parts = encoded.split("#", -1);
             if (parts.length != 3) return encoded;
             long nid = decode(parts[0]);
-            long library = decode(parts[1]);
-            long module = decode(parts[2]);
+            long library = decodeObjectId(parts[1]);
+            long module = decodeObjectId(parts[2]);
             ObjectInfo mod = modules.get(module);
             ObjectInfo lib = libraries.get(library);
-            if (mod == null || lib == null) return encoded;
+            if (nid == BAD || mod == null || lib == null) return encoded;
             String result = knownNids.get(nid);
-            if (result == null) result = String.format("nid%s_%s_%s_0x%016x", type == 2 ? "f" : "o", mod.name, lib.name, nid);
+            if (result == null) result = String.format("nid%s_%s_%s_0x%016x", type == 2 ? "f" : "o", sanitize(mod.name), sanitize(lib.name), nid);
             return result;
+        }
+
+        private void applyRelocations(long table, long size, String kind) throws Exception {
+            if (table == 0 || size == 0 || relaEnt < 24) return;
+            for (long offset = 0; offset + relaEnt <= size; offset += relaEnt) {
+                Address relocation = address(table + offset);
+                long target = q64(relocation);
+                long info = q64(relocation.add(8));
+                long addend = q64(relocation.add(16));
+                int type = (int) (info & 0xffffffffL);
+                long symbolIndex = info >>> 32;
+                if (type == 8) continue;
+                if (type != 6 && type != 7 && type != 1) {
+                    log.appendMsg("PS5 ELF analyzer: unsupported " + kind + " relocation type 0x" + Integer.toHexString(type));
+                    continue;
+                }
+                if (symbolIndex >= symbols.size()) continue;
+                SymbolInfo symbol = symbols.get((int) symbolIndex);
+                long value = symbol.value != 0 ? symbol.value : q64(address(target));
+                if (value != 0 && value != BAD && symbol.name != null) {
+                    label(value, symbol.name, "PS5 " + kind + " relocation at 0x" + Long.toHexString(target));
+                }
+                if (type == 1 && addend != 0 && symbol.name != null) {
+                    addComment(target, "PS5 relocation addend: 0x" + Long.toHexString(addend));
+                }
+            }
+        }
+
+        private void parseProcessParam(long start, long size) throws Exception {
+            if (size < 8) return;
+            addComment(start, "PS5 process parameter size: 0x" + Long.toHexString(q64(address(start))));
+            String magic = ascii(start + 8, 4);
+            if (!"ORBI".equals(magic)) {
+                log.appendMsg("PS5 ELF analyzer: invalid sceProcessParam magic: " + magic);
+                return;
+            }
+            addComment(start, "PS5 sceProcessParam: ORBI, entries=" + u32(address(start + 12)) +
+                    ", SDK=0x" + Long.toHexString(u32(address(start + 16))));
+        }
+
+        private void parseModuleParam(long start, long size) throws Exception {
+            if (size < 8) return;
+            String magic = ascii(start + 8, 4);
+            if (!"\u00bf\u00f4\u0013<".equals(magic)) {
+                addComment(start, "PS5 module parameter block (unknown magic " + magic + ")");
+                return;
+            }
+            addComment(start, "PS5 sceModuleParam: entries=" + u32(address(start + 12)) +
+                    ", SDK=0x" + Long.toHexString(q64(address(start + 16))));
+        }
+
+        private void parseCommentSegment(long start, long size) throws Exception {
+            long cursor = start;
+            long end = start + size;
+            while (cursor + 12 <= end) {
+                String key = ascii(cursor, 4).replace("\0", "").trim();
+                long length = u32(address(cursor + 8));
+                cursor += 12;
+                if (length > end - cursor) {
+                    log.appendMsg("PS5 ELF analyzer: truncated comment segment");
+                    return;
+                }
+                String value = ascii(cursor, length).replace("\0", "");
+                addComment(start, "PS5 metadata " + key + ": " + value);
+                cursor += length;
+            }
+        }
+
+        private void parseVersionSegment(long start, long size) throws Exception {
+            long cursor = start;
+            long end = start + size;
+            while (cursor + 4 <= end) {
+                int length = u16(address(cursor + 2));
+                cursor += 4;
+                if (length == 0) continue;
+                if (length > end - cursor) {
+                    log.appendMsg("PS5 ELF analyzer: truncated version segment");
+                    return;
+                }
+                int type = program.getMemory().getByte(address(cursor)) & 0xff;
+                addComment(start, "PS5 version record type 0x" + Integer.toHexString(type) + ": " + ascii(cursor + 1, length - 1));
+                cursor += length;
+            }
+        }
+
+        private String ascii(long start, long length) throws Exception {
+            StringBuilder result = new StringBuilder();
+            for (long i = 0; i < length && i < 0x10000; i++) {
+                result.append((char) (program.getMemory().getByte(address(start + i)) & 0xff));
+            }
+            return result.toString();
+        }
+
+        private String sanitize(String value) {
+            return value.replaceAll("[^a-zA-Z0-9_]", "_");
         }
 
         private void label(long value, String name, String comment) throws Exception {
@@ -263,8 +430,32 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
     private static final class ObjectInfo {
         String name = "unknown";
         String version = "0.0";
+        long nameOffset = -1;
         long attributes;
         boolean export;
+
+        String describe() {
+            return name + " v" + version + " attrs=0x" + Long.toHexString(attributes) +
+                    (export ? " export" : " import");
+        }
+    }
+
+    private static final class SymbolInfo {
+        final String name;
+        final String encodedName;
+        final long value;
+        final long size;
+        final int section;
+        final boolean function;
+
+        SymbolInfo(String name, String encodedName, long value, long size, int section, boolean function) {
+            this.name = name;
+            this.encodedName = encodedName;
+            this.value = value;
+            this.size = size;
+            this.section = section;
+            this.function = function;
+        }
     }
 
     private static long decode(String value) {
@@ -275,6 +466,17 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
             if (digit < 0) return BAD;
             if (i == value.length() - 1 && value.length() == 11) result = (result << 4) | (digit >> 2);
             else result = (result << 6) | digit;
+        }
+        return result;
+    }
+
+    private static long decodeObjectId(String value) {
+        if (value.length() == 0 || value.length() > 4) return BAD;
+        long result = 0;
+        for (int i = 0; i < value.length(); i++) {
+            int digit = NID_ALPHABET.indexOf(value.charAt(i));
+            if (digit < 0) return BAD;
+            result = (result << 6) | digit;
         }
         return result;
     }

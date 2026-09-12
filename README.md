@@ -15,17 +15,13 @@ names after loading.
 3. In Ghidra, use **File > Install Extensions** and select the generated ZIP.
 
 The extension is installed as `ps5-elf-analyzer`. The analyzer is enabled by default for little-endian x86-64 PS5 executables
-(`ET_SCE_EXEC_ASLR`) and PRX files (`ET_SCE_DYNAMIC`). It emits PS5 module and
-library information as program metadata and applies decoded exports and defined
-symbols as labels and functions.
-
-## Instructions
-
-TBA
+(`ET_SCE_EXEC_ASLR`) and PRX files (`ET_SCE_DYNAMIC`). It parses PS5 dynamic
+metadata, module and library descriptors, SCE comment/version and parameter
+segments, NID-encoded symbols, and RELA/JMPREL imports. Decoded exports and
+defined symbols are applied as labels and functions.
 
 ## Known bugs
-- Need to update some structures, e.g. sceProcessParam, to reflect more fields that it may take.
-- Need to parse exception handler sections properly because their format was changed since PS4. Could be useful to tweak function boundaries even more.
+- Exception-handler metadata is currently reported but not used to refine function boundaries.
 
 P.S. PRs with bug fixes and improvements are welcome here: [Flatz repository](https://github.com/flatz/ida_ps5_elf_plugin)
 

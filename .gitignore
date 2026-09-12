@@ -3,3 +3,4 @@ build/
 dist/
 bin/
 .vscode/
+ida_ps5_elf_plugin/
