@@ -1,0 +1,12 @@
+apply from: "${GHIDRA_INSTALL_DIR}/support/buildExtension.gradle"
+
+repositories {
+    mavenCentral()
+}
+
+sourceSets {
+    main {
+        java.srcDirs = ['src/main/java']
+        resources.srcDirs = ['src/main/resources', 'cfg']
+    }
+}

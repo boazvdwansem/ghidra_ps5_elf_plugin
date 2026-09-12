@@ -1,20 +1,20 @@
-## IDA PS5 .elf plugin (c) 2021-2026 by flatz
+# Ghidra PS5 ELF analyzer
 
-# Instructions
-* Put all files into their corresponding directories by keeping this directory's structure.
-* Use `64-bit IDA` and standard `ELF64 for x86-64 (Unknown) [elf64.dll]` when loading `.elf`/`.prx` file.
-* Apply any kernel options that you use usually.
-* If you see warning `Unsupported or unknown image type`, then press `Yes`, thus ignoring it.
-* Wait till plugin complete its own work. I use many heuristics to locate a lot of useful information within .elf file, so please be patient.
-* Ignore all possible warnings that may happen during processing. Some of structures are getting updates from one version of SDK to another, that may cause warnings as well until they will be fully supported.
-* If you want to add new symbols or edit existing ones, then update file `cfg/ps5_symbols.txt` and `til/prospero.til` optionally.
+This is the Ghidra 12.1.3 port of the PS5 ELF post-loader functionality. Ghidra's
+built-in ELF loader remains responsible for mapping segments and applying normal
+ELF relocations. `Ps5ElfAnalyzer` adds PS5-specific dynamic metadata and symbol
+names after loading.
 
-# Notes
-* If you use some cracked version of IDA and see annoying `__usercall` calling conventions that breaks code analysis when decompiling x64 functions, then it can be fixed by appending `idapro` to `DISABLE_USERCALL` list at `cfg/hexrays.cfg`. Another solution is modifying artificially broken `hexx64.dll` plugin by changing `idapro` string written there to `hexx64`, e.g.:
-  `69 64 61 70 72 6F 00 00 72 73 70 00 72 62 70 00` -> `68 65 78 78 36 34 00 00 72 73 70 00 72 62 70 00`
+## Install
 
-# Known bugs
-* Need to update some structures, e.g. sceProcessParam, to reflect more fields that it may take.
-* Need to parse exception handler sections properly because their format was changed since PS4. Could be useful to tweak function boundaries even more.
+1. Set `GHIDRA_INSTALL_DIR` to the Ghidra 12.1.3 installation directory in
+   `gradle.properties` or the environment.
+2. Run `gradlew.bat buildExtension` from a Gradle wrapper-enabled checkout, or
+   run the equivalent Gradle command with the Gradle distribution bundled with
+   your Ghidra setup. The existing `cfg/ps5_symbols.txt` is packaged directly.
+3. In Ghidra, use **File > Install Extensions** and select the generated ZIP.
 
-P.S. PRs with bug fixes and improvements are welcome.
+The extension is installed as `ps5-elf-analyzer`. The analyzer is enabled by default for little-endian x86-64 PS5 executables
+(`ET_SCE_EXEC_ASLR`) and PRX files (`ET_SCE_DYNAMIC`). It emits PS5 module and
+library information as program metadata and applies decoded exports and defined
+symbols as labels and functions.

@@ -1,0 +1,1 @@
+C:\Software\Ghidra\support\gradle\gradlew.bat buildExtension
