@@ -18,3 +18,7 @@ The extension is installed as `ps5-elf-analyzer`. The analyzer is enabled by def
 (`ET_SCE_EXEC_ASLR`) and PRX files (`ET_SCE_DYNAMIC`). It emits PS5 module and
 library information as program metadata and applies decoded exports and defined
 symbols as labels and functions.
+
+## Credits
+
+Flatz - https://github.com/flatz/ida_ps5_elf_plugin
