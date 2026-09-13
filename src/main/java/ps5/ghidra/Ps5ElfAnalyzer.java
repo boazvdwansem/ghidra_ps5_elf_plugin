@@ -1,6 +1,7 @@
 package ps5.ghidra;
 
 import ghidra.app.services.AbstractAnalyzer;
+import ghidra.app.services.AnalysisPriority;
 import ghidra.app.services.AnalyzerType;
 import ghidra.app.util.importer.MessageLog;
 import ghidra.program.model.address.Address;
@@ -91,6 +92,7 @@ public class Ps5ElfAnalyzer extends AbstractAnalyzer {
 
     public Ps5ElfAnalyzer() {
         super("PS5 ELF Analyzer", "Decodes PS5 ELF metadata and NID symbols", AnalyzerType.BYTE_ANALYZER);
+        setPriority(AnalysisPriority.FORMAT_ANALYSIS.before());
         setSupportsOneTimeAnalysis();
     }
 
